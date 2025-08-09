@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "tsc && chmod 755 build/index.js",
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "vitest run",
     "inspect": "npx @modelcontextprotocol/inspector node build/index.js"
   },
   "files": [
@@ -20,10 +20,13 @@
   "license": "ISC",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.2",
+    "chrome-remote-interface": "^0.33.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@types/chrome-remote-interface": "^0.31.0",
     "@types/node": "^24.2.1",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "vitest": "^2.1.8"
   }
 }

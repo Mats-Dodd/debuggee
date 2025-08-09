@@ -1,14 +1,23 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { spawn } from "node:child_process";
 import { z } from "zod";
+import CDP from "chrome-remote-interface";
 
-const NWS_API_BASE = "https://api.weather.gov";
-const USER_AGENT = "weather-app/1.0";
+type Session = {
+  id: string;
+  wsUrl: string;
+  client: CDP.Client;
+  process?: any;
+  breakpoints: Map<string, { id: string; file: string; line: number; column?: number }>;
+  lastPaused?: any;
+};
 
-// Create server instance
+const sessions = new Map<string, Session>();
+
 const server = new McpServer({
-  name: "weather",
-  version: "1.0.0",
+  name: "debuggee",
+  version: "0.1.0",
   capabilities: {
     resources: {},
     tools: {},
@@ -16,214 +25,141 @@ const server = new McpServer({
 });
 
 
-// Helper function for making NWS API requests
-async function makeNWSRequest<T>(url: string): Promise<T | null> {
-    const headers = {
-      "User-Agent": USER_AGENT,
-      Accept: "application/geo+json",
-    };
-  
+const StartSessionSchema = z.object({
+  entry: z.string().describe("Path to the main script to debug"),
+  args: z.array(z.string()).default([]).describe("Command line arguments for the script"),
+  cwd: z.string().optional().describe("Working directory (defaults to current)"),
+  inspectBrk: z.boolean().default(true).describe("Use --inspect-brk to pause on first line"),
+  runner: z.enum(["node", "tsx", "ts-node"]).default("node").describe("Runtime to use"),
+});
+
+function generateSessionId(): string {
+  return `${process.pid}-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+}
+
+server.tool(
+  "debug/start_session", 
+  {
+    description: "Start a new debugging session by spawning a Node process with inspector",
+    inputSchema: StartSessionSchema.shape,
+  },
+  async ({ entry, args, cwd, inspectBrk, runner }) => {
     try {
-      const response = await fetch(url, { headers });
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+      let nodeCmd: string;
+      let nodeArgs: string[];
+
+      switch (runner) {
+        case "tsx":
+          nodeCmd = "tsx";
+          nodeArgs = [inspectBrk ? "--inspect-brk" : "--inspect", entry, ...args];
+          break;
+        case "ts-node":
+          nodeCmd = "node";
+          nodeArgs = [
+            inspectBrk ? "--inspect-brk" : "--inspect",
+            "-r", "ts-node/register",
+            entry, ...args
+          ];
+          break;
+        default: // "node"
+          nodeCmd = "node";
+          nodeArgs = [inspectBrk ? "--inspect-brk" : "--inspect", entry, ...args];
+          break;
       }
-      return (await response.json()) as T;
+
+      const child = spawn(nodeCmd, nodeArgs, {
+        cwd: cwd || process.cwd(),
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+
+      const wsUrl: string = await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error("Timeout waiting for inspector WebSocket URL"));
+        }, 10000);
+
+        let stderr = "";
+
+        child.stderr.on("data", (chunk) => {
+          stderr += chunk.toString();
+          const match = stderr.match(/ws:\/\/[^\s]+/);
+          if (match) {
+            clearTimeout(timeout);
+            resolve(match[0]);
+          }
+        });
+
+        child.on("error", (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+
+        child.on("exit", (code) => {
+          if (code !== null) {
+            clearTimeout(timeout);
+            reject(new Error(`Process exited with code ${code} before inspector URL was found`));
+          }
+        });
+      });
+
+      const client = await CDP({ target: wsUrl });
+      const { Debugger, Runtime } = client;
+      
+      await Debugger.enable();
+      await Runtime.enable();
+
+      const sessionId = generateSessionId();
+      const session: Session = {
+        id: sessionId,
+        wsUrl,
+        client,
+        process: child,
+        breakpoints: new Map(),
+      };
+        
+      client.on("Debugger.paused", (event: any) => {
+        session.lastPaused = event;
+      });
+
+      client.on("Debugger.resumed", () => {
+        session.lastPaused = undefined;
+      });
+
+      sessions.set(sessionId, session);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              sessionId,
+              wsUrl,
+              pid: child.pid,
+              runner,
+              entry,
+            }, null, 2),
+          },
+        ],
+      };
+
     } catch (error) {
-      console.error("Error making NWS request:", error);
-      return null;
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: `Failed to start debug session: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
     }
   }
-  
-  interface AlertFeature {
-    properties: {
-      event?: string;
-      areaDesc?: string;
-      severity?: string;
-      status?: string;
-      headline?: string;
-    };
-  }
-  
-  // Format alert data
-  function formatAlert(feature: AlertFeature): string {
-    const props = feature.properties;
-    return [
-      `Event: ${props.event || "Unknown"}`,
-      `Area: ${props.areaDesc || "Unknown"}`,
-      `Severity: ${props.severity || "Unknown"}`,
-      `Status: ${props.status || "Unknown"}`,
-      `Headline: ${props.headline || "No headline"}`,
-      "---",
-    ].join("\n");
-  }
-  
-  interface ForecastPeriod {
-    name?: string;
-    temperature?: number;
-    temperatureUnit?: string;
-    windSpeed?: string;
-    windDirection?: string;
-    shortForecast?: string;
-  }
-  
-  interface AlertsResponse {
-    features: AlertFeature[];
-  }
-  
-  interface PointsResponse {
-    properties: {
-      forecast?: string;
-    };
-  }
-  
-  interface ForecastResponse {
-    properties: {
-      periods: ForecastPeriod[];
-    };
-  }
-
-// Register weather tools
-server.tool(
-    "get_alerts",
-    "Get weather alerts for a state",
-    {
-      state: z.string().length(2).describe("Two-letter state code (e.g. CA, NY)"),
-    },
-    async ({ state }) => {
-      const stateCode = state.toUpperCase();
-      const alertsUrl = `${NWS_API_BASE}/alerts?area=${stateCode}`;
-      const alertsData = await makeNWSRequest<AlertsResponse>(alertsUrl);
-  
-      if (!alertsData) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Failed to retrieve alerts data",
-            },
-          ],
-        };
-      }
-  
-      const features = alertsData.features || [];
-      if (features.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `No active alerts for ${stateCode}`,
-            },
-          ],
-        };
-      }
-  
-      const formattedAlerts = features.map(formatAlert);
-      const alertsText = `Active alerts for ${stateCode}:\n\n${formattedAlerts.join("\n")}`;
-  
-      return {
-        content: [
-          {
-            type: "text",
-            text: alertsText,
-          },
-        ],
-      };
-    },
-  );
-  
-  server.tool(
-    "get_forecast",
-    "Get weather forecast for a location",
-    {
-      latitude: z.number().min(-90).max(90).describe("Latitude of the location"),
-      longitude: z
-        .number()
-        .min(-180)
-        .max(180)
-        .describe("Longitude of the location"),
-    },
-    async ({ latitude, longitude }) => {
-      // Get grid point data
-      const pointsUrl = `${NWS_API_BASE}/points/${latitude.toFixed(4)},${longitude.toFixed(4)}`;
-      const pointsData = await makeNWSRequest<PointsResponse>(pointsUrl);
-  
-      if (!pointsData) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Failed to retrieve grid point data for coordinates: ${latitude}, ${longitude}. This location may not be supported by the NWS API (only US locations are supported).`,
-            },
-          ],
-        };
-      }
-  
-      const forecastUrl = pointsData.properties?.forecast;
-      if (!forecastUrl) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Failed to get forecast URL from grid point data",
-            },
-          ],
-        };
-      }
-  
-      // Get forecast data
-      const forecastData = await makeNWSRequest<ForecastResponse>(forecastUrl);
-      if (!forecastData) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Failed to retrieve forecast data",
-            },
-          ],
-        };
-      }
-  
-      const periods = forecastData.properties?.periods || [];
-      if (periods.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "No forecast periods available",
-            },
-          ],
-        };
-      }
-  
-      const formattedForecast = periods.map((period: ForecastPeriod) =>
-        [
-          `${period.name || "Unknown"}:`,
-          `Temperature: ${period.temperature || "Unknown"}°${period.temperatureUnit || "F"}`,
-          `Wind: ${period.windSpeed || "Unknown"} ${period.windDirection || ""}`,
-          `${period.shortForecast || "No forecast available"}`,
-          "---",
-        ].join("\n"),
-      );
-  
-      const forecastText = `Forecast for ${latitude}, ${longitude}:\n\n${formattedForecast.join("\n")}`;
-  
-      return {
-        content: [
-          {
-            type: "text",
-            text: forecastText,
-          },
-        ],
-      };
-    },
-  );
+);
 
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Weather MCP Server running on stdio");
+  console.error("TypeScript Node Debugger MCP Server running on stdio");
 }
 
 main().catch((error) => {
