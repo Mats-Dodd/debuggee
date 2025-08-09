@@ -12,13 +12,15 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "inspect": "npx @modelcontextprotocol/inspector node build/index.js"
   },
-  "files": ["build"],
+  "files": [
+    "build"
+  ],
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.2",
-    "zod": "^3.23.8"
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^24.2.1",
